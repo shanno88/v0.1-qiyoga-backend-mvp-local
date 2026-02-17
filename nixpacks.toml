@@ -2,4 +2,7 @@
 aptPkgs = ["libgl1", "libglib2.0-0"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt --constraint constraints.txt"]
+cmds = [
+  "python -m venv --copies /opt/venv",
+  ". /opt/venv/bin/activate && pip install -r requirements.txt --constraint constraints.txt"
+]
