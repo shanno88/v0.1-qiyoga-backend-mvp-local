@@ -12,7 +12,12 @@ from openai import OpenAI
 
 from config import settings
 from utils.file_handler import save_upload_file, cleanup_file
-from utils.text_parser import extract_key_info
+from utils.text_parser import (
+    extract_key_info,
+    validate_summary_response,
+    build_key_info_from_summary,
+    filter_and_extract_high_risk_clauses,
+)
 from services.ocr_service import get_ocr_service
 from services.pdf_service import get_pdf_service
 
@@ -77,22 +82,84 @@ You will receive clauses in this format:
 [risk level: safe/caution/danger]
 ---END---
 
+NOISE FILTERING (IMPORTANT)
+If a clause is obviously just noise (section numbers like "1", "2", "Section 5", page markers, pure formatting), output:
+{"skip": true}
+The backend will filter these out. Focus your analysis on substantive clauses only.
+
 OUTPUT FORMAT (STRICT JSON)
-For each clause, output a JSON object with these exact fields:
+For substantive clauses, output a JSON object with these exact fields:
 {
-  "analysis_en": "1-2 sentences in English explaining what this clause means and any concerns",
-  "analysis_zh": "1-2 sentences in Chinese (中文解释) summarizing the analysis for a student",
-  "suggestion_en": "1 sentence in English with practical advice for the tenant",
-  "suggestion_zh": "1 sentence in Chinese (中文建议) with the same advice"
+  "analysis_en": "1-2 sentences: what this clause means and concerns",
+  "analysis_zh": "1-2 sentences in Chinese following the template below",
+  "suggestion_en": "1 sentence with practical advice",
+  "suggestion_zh": "1 sentence in Chinese following the template below"
 }
 
+CHINESE OUTPUT TEMPLATES
+
+analysis_zh template (2 parts):
+1. First, briefly describe what the clause regulates
+2. Then, explicitly state the impact on the tenant (financial risk, flexibility loss, rights limitation)
+
+Example structure: "该条款规定了[内容]，对租客的影响是[具体后果/风险]。"
+- Focus on WORST-CASE scenarios when relevant
+- Mention specific dollar amounts or time limits if present
+
+suggestion_zh template:
+Give 1-2 practical, actionable steps using phrases like:
+- "务必提前确认..." (Make sure to confirm in advance...)
+- "如果不接受，可以跟房东协商..." (If unacceptable, negotiate with landlord...)
+- "建议记录在书面合同中..." (Recommend documenting in written contract...)
+- "注意保留..." (Keep records of...)
+- "签约前建议..." (Before signing, consider...)
+
 RULES
-1. analysis_en and analysis_zh must be related (same content, different languages)
-2. suggestion_en and suggestion_zh must be related (same content, different languages)
-3. Chinese text should be natural and student-friendly, not formal legal language
-4. Keep each field concise (1-2 sentences max)
-5. Output ONLY valid JSON, no markdown or extra text
+1. Chinese output should be practical and actionable, not generic filler
+2. Focus on tenant's financial risk, rights, and flexibility
+3. Be specific: mention amounts, deadlines, conditions when present
+4. For safe clauses, still explain what it does and confirm it's standard
+5. Output ONLY valid JSON, no markdown
 6. For multiple clauses, output a JSON array: [{...}, {...}]"""
+
+LEASE_SUMMARY_SYSTEM_PROMPT = """You are a lease document analyst. Extract structured information from lease text.
+
+YOUR TASK
+Extract the following fields from the lease document. Return ONLY valid JSON with these exact fields:
+
+{
+  "monthly_rent_amount": <number or null>,
+  "currency": "<USD or other currency code>",
+  "lease_start_date": "<ISO date YYYY-MM-DD or null>",
+  "lease_end_date": "<ISO date YYYY-MM-DD or null>",
+  "lease_duration_months": <integer or null>,
+  "security_deposit_amount": <number or null>,
+  "landlord_name": "<name or null>",
+  "tenant_name": "<name or null>",
+  "late_fee_summary_zh": "<one Chinese sentence describing late fee rule, or '未明确写明滞纳金条款'>",
+  "early_termination_risk_zh": "<one Chinese sentence about early termination risk, or '未明确写明提前解约条款'>",
+  "overall_risk": "<low|medium|high>"
+}
+
+FIELD RULES
+- monthly_rent_amount: Extract the numeric monthly rent (e.g., 685). If only weekly/annual given, convert to monthly.
+- currency: Usually "USD" for US leases
+- lease_start_date: Format as YYYY-MM-DD. Convert "July 1, 2012" to "2012-07-01"
+- lease_end_date: Format as YYYY-MM-DD
+- lease_duration_months: Calculate from dates if not explicitly stated. 12 months = 1 year.
+- security_deposit_amount: Usually equals 1 month rent, but extract actual value if stated
+- landlord_name: Full name or company name of landlord/lessor
+- tenant_name: Full name of tenant/lessee
+- late_fee_summary_zh: Example: "滞纳金为每日5美元，从到期日后第5天开始计算"
+- early_termination_risk_zh: Example: "提前解约需支付2个月租金作为违约金" or warn if clause is missing
+- overall_risk: "low"=standard lease, "medium"=some concerning terms, "high"=significant risks
+
+RULES
+1. Return ONLY valid JSON, no markdown or explanations
+2. Use null for fields not found in the document
+3. Be precise with dates and numbers
+4. Chinese summaries should be natural and concise (1 sentence each)
+5. Calculate overall_risk based on: deposit amount, termination terms, fee structures"""
 
 
 def parse_bilingual_response(response_text: str) -> List[Dict[str, str]]:
@@ -139,6 +206,43 @@ async def get_chinese_explanation(english_text: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"DeepSeek error in get_chinese_explanation: {e}")
         return None
+
+
+async def extract_lease_summary_llm(full_text: str) -> Dict[str, Any]:
+    """
+    Extract structured lease summary using LLM.
+    Returns a dict with monthly_rent_amount, currency, dates, etc.
+    This function does NOT modify any existing code paths.
+    """
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": LEASE_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": full_text[:8000]},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+
+        raw_content = response.choices[0].message.content or "{}"
+
+        clean = raw_content.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean
+        if clean.endswith("```"):
+            clean = clean.rsplit("```", 1)[0]
+
+        parsed = json.loads(clean.strip())
+        logger.info(f"LLM summary extraction successful")
+        return parsed
+
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM summary JSON parse error: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"LLM summary extraction failed: {e}")
+        return {}
 
 
 # In-memory storage for analysis results
@@ -202,7 +306,7 @@ async def get_chinese_explanation_batch(texts: List[str]) -> List[str]:
 
 async def get_bilingual_analysis_batch(
     clause_data: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """
     Get bilingual analysis and suggestion for multiple clauses in a single AI call.
     Input: list of dicts with 'clause_text' and 'risk_level' keys
@@ -250,8 +354,19 @@ async def get_bilingual_analysis_batch(
 
             parsed = json.loads(clean_result)
             if isinstance(parsed, list):
-                return parsed
+                results = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        if item.get("skip"):
+                            results.append({"_skip": True})
+                        else:
+                            results.append(item)
+                    else:
+                        results.append({})
+                return results
             elif isinstance(parsed, dict):
+                if parsed.get("skip"):
+                    return [{"_skip": True}]
                 return [parsed]
         except json.JSONDecodeError:
             logger.error(f"Failed to parse AI response as JSON: {result[:200]}")
@@ -407,6 +522,9 @@ async def generate_sample_clauses(
     for i, data in enumerate(clause_data_for_analysis):
         bilingual = bilingual_analyses[i] if i < len(bilingual_analyses) else {}
 
+        if bilingual.get("_skip"):
+            continue
+
         analysis_en = bilingual.get(
             "analysis_en", "This clause has been analyzed for potential concerns."
         )
@@ -548,11 +666,28 @@ async def analyze_lease(
             }
 
         logger.info(f"Extracted {len(full_text)} characters from document")
-        key_info = extract_key_info(full_text)
+
+        # Extract structured summary using LLM
+        raw_summary = await extract_lease_summary_llm(full_text)
+        summary = validate_summary_response(raw_summary)
+
+        # Build key_info from summary with fallback to regex extraction
+        if summary.get("monthly_rent_amount") or summary.get("lease_start_date"):
+            key_info = build_key_info_from_summary(summary)
+            logger.info("Using LLM-based key_info")
+        else:
+            key_info = extract_key_info(full_text)
+            logger.info("Using regex-based key_info as fallback")
 
         all_clauses, ai_duration = await generate_sample_clauses(
             full_text, fast_mode=False
         )
+
+        # Filter noise and extract high-risk clauses
+        filtered_clauses, high_risk_clauses = filter_and_extract_high_risk_clauses(
+            all_clauses
+        )
+        all_clauses = filtered_clauses
 
         if settings.should_bypass_test_user(user_id):
             logger.info(f"Test user bypass enabled for: {user_id}")
@@ -588,7 +723,9 @@ async def analyze_lease(
         ANALYSIS_STORE[analysis_id] = {
             "full_text": full_text,
             "key_info": key_info,
+            "summary": summary,
             "all_clauses": all_clauses,
+            "high_risk_clauses": high_risk_clauses,
             "lines": [
                 {"text": line["text"], "confidence": line["confidence"]}
                 for line in ocr_result.get("lines", [])
@@ -622,7 +759,9 @@ async def analyze_lease(
                 "analysis_id": analysis_id,
                 "full_text": full_text,
                 "key_info": key_info,
+                "summary": summary,
                 "clauses": all_clauses,
+                "high_risk_clauses": high_risk_clauses,
                 "total_clauses": len(all_clauses),
                 "shown_clauses": len(all_clauses),
                 "max_clauses": len(all_clauses),
@@ -706,7 +845,9 @@ async def get_full_report(
                 "analysis_id": analysis_id,
                 "full_text": analysis["full_text"],
                 "key_info": analysis["key_info"],
+                "summary": analysis.get("summary", {}),
                 "clauses": analysis["all_clauses"],
+                "high_risk_clauses": analysis.get("high_risk_clauses", []),
                 "total_clauses": len(analysis["all_clauses"]),
                 "shown_clauses": len(analysis["all_clauses"]),
                 "has_full_access": check_user_access(user_id)["has_access"],
