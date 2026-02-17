@@ -7,3 +7,4 @@ httpx
 rapidocr-onnxruntime
 pymupdf
 Pillow
+opencv-python-headless
