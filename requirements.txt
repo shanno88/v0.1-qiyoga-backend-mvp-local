@@ -5,6 +5,8 @@ pydantic-settings
 openai
 httpx
 opencv-python-headless==4.10.0.84
+opencv-python==99.99.99
 rapidocr-onnxruntime
 pymupdf
 Pillow
+
